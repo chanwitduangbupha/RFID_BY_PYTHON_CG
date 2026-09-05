@@ -1,6 +1,7 @@
 import sys
 import socket
 import csv
+import sqlite3
 import time
 import re
 import json
@@ -10,8 +11,15 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:
+    serial = None
+    list_ports = None
+
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
-from PyQt6.QtGui import QTextDocument, QFont, QIcon
+from PyQt6.QtGui import QTextDocument, QFont, QIcon, QFontDatabase
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
 from PyQt6.QtWidgets import (
     QApplication,
@@ -45,14 +53,42 @@ import bcrypt
 
 DEFAULT_IP = "192.168.1.190"
 DEFAULT_PORT = 6000
+DEFAULT_BAUDRATE = 115200
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# Legacy only: scan history is now stored in student.db.
 LOG_FILE = BASE_DIR / "rfid_tags.txt"
+VISIBLE_LATEST_TAGS = 5  # แสดงเฉพาะรายการล่าสุดบนหน้าจอ แต่ยังเก็บข้อมูลทั้งหมดไว้ใน self.tags
+# Legacy files: retained only for compatibility; runtime uses student.db.
 ROUND_FILE = BASE_DIR / "round.txt"
 STUDENT_FILE = BASE_DIR / "student.csv"
+STUDENT_DB_FILE = BASE_DIR / "student.db"
 
 READER_ADDRESS = 0x00
+
+# RFID RF output power (dBm)
+# Default RF power for short-range passage/check-in reading.
+RF_POWER_DBM = 18
+
+
+# ============================================================
+# PROMPT FONT
+# ============================================================
+
+def load_prompt_font():
+    """โหลดฟอนต์ Prompt จากโฟลเดอร์ fonts ที่อยู่ข้าง production.py"""
+    font_path = BASE_DIR / "fonts" / "PROMPT-REGULAR.TTF"
+
+    if font_path.exists():
+        font_id = QFontDatabase.addApplicationFont(str(font_path))
+
+        if font_id >= 0:
+            families = QFontDatabase.applicationFontFamilies(font_id)
+            if families:
+                return families[0]
+
+    return "Prompt"
 
 
 # ============================================================
@@ -131,6 +167,34 @@ def make_inventory_command():
 
 
 # ============================================================
+# SET RFID RF POWER
+# Protocol command: 05 00 2F <power> <CRC16>
+# Example from the reader protocol: power 30 dBm ->
+# 05 00 2F 1E 72 34
+# ============================================================
+
+def make_power_command(power_dbm=RF_POWER_DBM):
+    power_dbm = int(power_dbm)
+
+    if not 0 <= power_dbm <= 33:
+        raise ValueError("RF power must be between 0 and 33 dBm")
+
+    data = bytes([
+        0x05,
+        READER_ADDRESS,
+        0x2F,
+        power_dbm
+    ])
+
+    crc = crc16(data)
+
+    return data + bytes([
+        crc & 0xFF,
+        (crc >> 8) & 0xFF
+    ])
+
+
+# ============================================================
 # RFID WORKER
 # ============================================================
 
@@ -153,13 +217,21 @@ class RFIDWorker(QThread):
         self,
         ip,
         port,
-        interval_ms
+        interval_ms,
+        rf_power_dbm=RF_POWER_DBM,
+        connection_type="TCP",
+        com_port="",
+        baudrate=DEFAULT_BAUDRATE
     ):
         super().__init__()
 
         self.ip = ip
         self.port = port
         self.interval_ms = interval_ms
+        self.rf_power_dbm = int(rf_power_dbm)
+        self.connection_type = connection_type.upper()
+        self.com_port = com_port
+        self.baudrate = int(baudrate)
 
         self.running = True
         self.scanning = False
@@ -167,6 +239,7 @@ class RFIDWorker(QThread):
         self.round_token = ""
 
         self.sock = None
+        self.serial_port = None
 
 
     def start_scan(self):
@@ -204,10 +277,45 @@ class RFIDWorker(QThread):
             except Exception:
                 pass
 
+        if self.serial_port:
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
+            self.serial_port = None
+
+
+    def send_data(self, data):
+        if self.connection_type == "COM":
+            self.serial_port.write(data)
+            self.serial_port.flush()
+        else:
+            self.sock.sendall(data)
+
 
     def read_frame(self):
 
         try:
+            if self.connection_type == "COM":
+                if not self.serial_port:
+                    return None
+
+                first = self.serial_port.read(1)
+                if not first:
+                    return None
+
+                length = first[0]
+                data = bytearray(first)
+                remaining = length
+
+                while remaining > 0:
+                    chunk = self.serial_port.read(remaining)
+                    if not chunk:
+                        return None
+                    data.extend(chunk)
+                    remaining -= len(chunk)
+
+                return bytes(data)
 
             first = self.sock.recv(1)
 
@@ -235,7 +343,7 @@ class RFIDWorker(QThread):
 
             return bytes(data)
 
-        except socket.timeout:
+        except (socket.timeout, TimeoutError):
             return None
 
         except Exception:
@@ -369,37 +477,102 @@ class RFIDWorker(QThread):
             )
 
 
-            self.sock = socket.socket(
-                socket.AF_INET,
-                socket.SOCK_STREAM
-            )
+            if self.connection_type == "COM":
+                if serial is None:
+                    raise RuntimeError(
+                        "ยังไม่ได้ติดตั้ง pyserial กรุณาใช้: pip install pyserial"
+                    )
+                if not self.com_port:
+                    raise RuntimeError("ยังไม่ได้เลือก COM Port")
 
-            self.sock.settimeout(
-                1.0
-            )
-
-
-            self.sock.connect(
-                (
-                    self.ip,
-                    self.port
+                self.serial_port = serial.Serial(
+                    port=self.com_port,
+                    baudrate=self.baudrate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.5,
+                    write_timeout=0.5
                 )
-            )
+
+                self.status_changed.emit(
+                    f"Connected - {self.com_port} @ {self.baudrate}"
+                )
+            else:
+                self.sock = socket.socket(
+                    socket.AF_INET,
+                    socket.SOCK_STREAM
+                )
+
+                self.sock.settimeout(
+                    0.5
+                )
+
+                try:
+                    self.sock.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_KEEPALIVE,
+                        1
+                    )
+                except Exception:
+                    pass
+
+                self.sock.connect(
+                    (
+                        self.ip,
+                        self.port
+                    )
+                )
 
 
-            self.status_changed.emit(
-                f"Connected - Ready"
-            )
+            # --------------------------------------------------------
+            # Set RF output power selected by the user immediately after connect.
+            # The response is consumed before starting inventory so it
+            # cannot be mistaken for an RFID tag frame.
+            # --------------------------------------------------------
+            try:
+                power_command = make_power_command(self.rf_power_dbm)
+
+                print(
+                    "TX POWER:",
+                    power_command.hex(" ").upper()
+                )
+
+                self.send_data(power_command)
+
+                power_response = self.read_frame()
+
+                if power_response:
+                    print(
+                        "RX POWER:",
+                        power_response.hex(" ").upper()
+                    )
+
+                self.status_changed.emit(
+                    f"Connected - Ready - RF Power {self.rf_power_dbm} dBm"
+                )
+
+            except Exception as power_error:
+                # Do not stop RFID reading if the reader firmware does not
+                # support the power command. Inventory can still continue.
+                print(
+                    "RF POWER SET ERROR:",
+                    power_error
+                )
+
+                self.status_changed.emit(
+                    "Connected - Ready"
+                )
 
 
             print(
                 "=" * 65
             )
 
-            print(
-                f"Connected to "
-                f"{self.ip}:{self.port}"
-            )
+            if self.connection_type == "COM":
+                print(f"Connected to {self.com_port} @ {self.baudrate}")
+            else:
+                print(f"Connected to {self.ip}:{self.port}")
 
 
             command = (
@@ -424,7 +597,7 @@ class RFIDWorker(QThread):
                     continue
 
 
-                self.sock.sendall(
+                self.send_data(
                     command
                 )
 
@@ -502,8 +675,15 @@ class RFIDWorker(QThread):
                 except Exception:
                     pass
 
-
             self.sock = None
+
+            if self.serial_port:
+                try:
+                    self.serial_port.close()
+                except Exception:
+                    pass
+
+            self.serial_port = None
 
             self.reader_finished.emit()
 
@@ -546,24 +726,46 @@ class MainWindow(QMainWindow):
 
         # UI อ่านง่าย โดยเฉพาะหน้าจอขนาดเล็ก
         self.setStyleSheet("""
+            QWidget {
+                font-family: "Prompt", "Noto Sans Thai", "Tahoma";
+                font-size: 10pt;
+            }
             QLabel {
+                font-family: "Prompt", "Noto Sans Thai", "Tahoma";
                 font-size: 10pt;
             }
             QLineEdit, QComboBox {
+                font-family: "Prompt", "Noto Sans Thai", "Tahoma";
                 min-height: 28px;
                 font-size: 10pt;
             }
             QPushButton {
+                font-family: "Prompt", "Noto Sans Thai", "Tahoma";
                 min-height: 28px;
                 font-size: 10pt;
             }
             QGroupBox {
+                font-family: "Prompt", "Noto Sans Thai", "Tahoma";
                 font-weight: bold;
+            }
+            QTableWidget, QTableWidgetItem, QHeaderView {
+                font-family: "Prompt", "Noto Sans Thai", "Tahoma";
+                font-size: 10pt;
+            }
+            QTabWidget, QTabBar {
+                font-family: "Prompt", "Noto Sans Thai", "Tahoma";
+                font-size: 10pt;
             }
         """)
 
 
         self.worker = None
+
+        # True เมื่อผู้ใช้กด Close/Exit เอง
+        # False เมื่อ reader หลุดเอง ซึ่งสามารถ reconnect ได้
+        self.manual_reader_close = False
+
+        self.reconnect_timer = None
 
         self.tags = {}
 
@@ -587,6 +789,36 @@ class MainWindow(QMainWindow):
         self.api_authenticated = False
 
         self.api_sent_count = 0
+
+        # -----------------------------------------------------
+        # RFID Passage Mode
+        # รับเฉพาะการผ่านประตู ไม่อ่าน tag ที่ค้างซ้ำ ๆ
+        # -----------------------------------------------------
+        self.passage_rearm_seconds = 3.0
+        self.passage_last_seen = {}
+
+        # Dashboard refresh แบบหน่วง เพื่อไม่ให้ UI ค้างเมื่อมี tag จำนวนมาก
+        self.dashboard_refresh_timer = QTimer(self)
+        self.dashboard_refresh_timer.setSingleShot(True)
+        self.dashboard_refresh_timer.timeout.connect(self.refresh_dashboard)
+
+        self.auto_resume_scan = False
+
+        # -----------------------------------------------------
+        # Bulk loader: โหลด RFID เฉพาะรอบที่เลือกจนเสร็จ
+        # -----------------------------------------------------
+        self.api_bulk_timer = QTimer(self)
+        self.api_bulk_timer.setInterval(50)
+        self.api_bulk_timer.timeout.connect(
+            self.api_bulk_send_next
+        )
+        self.api_bulk_queue = []
+        self.api_bulk_index = 0
+        self.api_bulk_round = ''
+        self.api_bulk_total = 0
+        self.api_bulk_success = 0
+        self.api_bulk_failed = 0
+        self.api_bulk_running = False
 
         self.api_last_file_size = 0
 
@@ -630,82 +862,32 @@ class MainWindow(QMainWindow):
     # ========================================================
 
     def load_round_tokens(self):
-
+        """Load round tokens from round_tokens table in student.db."""
         tokens = {}
 
-
-        if not ROUND_FILE.exists():
-
-            print(
-                f"ไม่พบไฟล์ {ROUND_FILE.name}"
-            )
-
-            return tokens
-
-
         try:
+            if not STUDENT_DB_FILE.exists():
+                print(f"ไม่พบฐานข้อมูล: {STUDENT_DB_FILE}")
+                return tokens
 
-            with open(
-                ROUND_FILE,
-                "r",
-                encoding="utf-8-sig"
-            ) as file:
+            conn = sqlite3.connect(str(STUDENT_DB_FILE), timeout=10)
+            rows = conn.execute(
+                "SELECT round, token FROM round_tokens ORDER BY round"
+            ).fetchall()
+            conn.close()
 
-                for line in file:
+            for round_name, token in rows:
+                round_name = normalize_text(round_name).upper()
+                token = normalize_text(token)
 
-                    line = line.strip()
-
-                    if not line:
-                        continue
-
-
-                    parts = line.split(
-                        None,
-                        1
-                    )
-
-
-                    if len(parts) < 2:
-                        continue
-
-
-                    round_name = (
-                        parts[0]
-                        .strip()
-                        .upper()
-                    )
-
-                    token = (
-                        parts[1]
-                        .strip()
-                    )
-
-
-                    if re.fullmatch(
-                        r"R(?:10|[1-9])",
-                        round_name
-                    ):
-
-                        tokens[
-                            round_name
-                        ] = token
-
+                if re.fullmatch(r"R(?:10|[1-9])", round_name) and token:
+                    tokens[round_name] = token
 
         except Exception as e:
+            print("Round DB error:", e)
 
-            print(
-                "Round file error:",
-                e
-            )
-
-
-        print(
-            "Loaded Round-Token:",
-            tokens
-        )
-
+        print("Loaded Round-Token from student.db:", tokens)
         return tokens
-
 
     def get_round_token(
         self,
@@ -719,160 +901,100 @@ class MainWindow(QMainWindow):
 
 
     # ========================================================
-    # STUDENT CSV
+    # STUDENT DATABASE (SQLite)
+    # ========================================================
+
+    # STUDENT DATABASE - SQLite only
     # ========================================================
 
     def load_student_data(self):
-
+        """Load student master data from student.db into memory."""
         self.student_data = []
 
-
-        if not STUDENT_FILE.exists():
-
-            print(
-                "ไม่พบ student.csv"
-            )
-
-            return
-
-
         try:
+            if not STUDENT_DB_FILE.exists():
+                print(f"ไม่พบ student.db: {STUDENT_DB_FILE}")
+                return
 
-            with open(
-                STUDENT_FILE,
-                "r",
-                encoding="utf-8-sig",
-                newline=""
-            ) as file:
+            conn = sqlite3.connect(str(STUDENT_DB_FILE), timeout=10)
+            conn.row_factory = sqlite3.Row
 
-                reader = csv.DictReader(
-                    file
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='student'"
+            ).fetchone()
+            if table is None:
+                conn.close()
+                print("student.db ไม่มี table student")
+                return
+
+            rows = conn.execute("""
+                SELECT rfid, std_id, seq, fullname, faculty, major, educational
+                FROM student
+                WHERE rfid IS NOT NULL AND TRIM(rfid) <> ''
+            """).fetchall()
+            conn.close()
+
+            self.student_data = []
+            for row in rows:
+                self.student_data.append({
+                    "rfid": normalize_rfid(row["rfid"]),
+                    "std_id": normalize_text(row["std_id"]),
+                    "seq": normalize_text(row["seq"]),
+                    "fullname": normalize_text(row["fullname"]),
+                    "faculty": normalize_text(row["faculty"]),
+                    "major": normalize_text(row["major"]),
+                    "educational": normalize_text(row["educational"]),
+                })
+
+            # Fast lookup in RAM: RFID -> student
+            self.student_by_rfid = {
+                item["rfid"]: item
+                for item in self.student_data
+                if item.get("rfid")
+            }
+
+            # ตารางบันทึกการเข้าสแกน/เข้าซ้อม
+            # ใช้แทน rfid_tags.txt ในระบบใหม่
+            conn = sqlite3.connect(
+                str(STUDENT_DB_FILE),
+                timeout=10
+            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS rfid_tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    round TEXT NOT NULL,
+                    token TEXT,
+                    epc TEXT NOT NULL,
+                    std_id TEXT,
+                    seq TEXT,
+                    fullname TEXT,
+                    created_at TEXT NOT NULL
                 )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_rfid_tags_timestamp
+                ON rfid_tags(timestamp)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_rfid_tags_round
+                ON rfid_tags(round)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_rfid_tags_epc
+                ON rfid_tags(epc)
+            """)
+            conn.commit()
+            conn.close()
 
-
-                fields = (
-                    reader.fieldnames
-                    or []
-                )
-
-
-                field_map = {}
-
-                for field in fields:
-
-                    key = (
-                        str(field)
-                        .strip()
-                        .lower()
-                        .replace(
-                            "\ufeff",
-                            ""
-                        )
-                    )
-
-                    field_map[
-                        key
-                    ] = field
-
-
-                def get_value(
-                    row,
-                    *names
-                ):
-
-                    for name in names:
-
-                        original = (
-                            field_map.get(
-                                name.lower()
-                            )
-                        )
-
-                        if original is not None:
-
-                            value = normalize_text(
-                                row.get(
-                                    original
-                                )
-                            )
-
-                            if value:
-                                return value
-
-                    return ""
-
-
-                for row in reader:
-
-                    rfid = normalize_rfid(
-                        get_value(
-                            row,
-                            "rfid",
-                            "epc",
-                            "tag",
-                            "tag_id"
-                        )
-                    )
-
-
-                    self.student_data.append(
-                        {
-                            "rfid": rfid,
-
-                            "std_id": get_value(
-                                row,
-                                "std_id",
-                                "student_id",
-                                "studentid",
-                                "รหัสนักศึกษา"
-                            ),
-
-                            "seq": get_value(
-                                row,
-                                "seq",
-                                "sequence",
-                                "ลำดับ"
-                            ),
-
-                            "fullname": get_value(
-                                row,
-                                "fullname",
-                                "full_name",
-                                "name",
-                                "ชื่อ-นามสกุล"
-                            ),
-
-                            "faculty": get_value(
-                                row,
-                                "faculty",
-                                "คณะ"
-                            ),
-
-                            "major": get_value(
-                                row,
-                                "major",
-                                "program",
-                                "สาขาวิชา"
-                            ),
-
-                            "educational": get_value(
-                                row,
-                                "educational",
-                                "education",
-                                "degree",
-                                "ชื่อปริญญา"
-                            )
-                        }
-                    )
-
+            print("Student DB:", STUDENT_DB_FILE)
+            print("Dashboard Student:", len(self.student_data))
+            print("Dashboard RFID:", len(self.student_by_rfid))
 
         except Exception as e:
-
-            print(
-                "Student CSV error:",
-                e
-            )
-
+            print("Student DB error:", e)
+            self.student_data = []
+            self.student_by_rfid = {}
 
         print(
             "Dashboard Student:",
@@ -897,119 +1019,175 @@ class MainWindow(QMainWindow):
     # ========================================================
 
     def read_rfid_log(self):
+        """
+        อ่านประวัติการเข้าสแกน/เข้าซ้อมจาก SQLite
+        แทน rfid_tags.txt
+
+        โครงสร้างเดิมที่ใช้กับ API ยังคงเป็น:
+            timestamp / token / epc / round
+        """
 
         records = []
 
-
-        if not LOG_FILE.exists():
-            return records
-
-
-        # Token -> R1/R2/...
-        token_to_round = {}
-
-        for round_name, token in (
-            self.round_tokens.items()
-        ):
-
-            key = normalize_rfid(
-                token
-            )
-
-            if key:
-
-                token_to_round[
-                    key
-                ] = round_name
-
-
         try:
+            if not STUDENT_DB_FILE.exists():
+                return records
 
-            with open(
-                LOG_FILE,
-                "r",
-                encoding="utf-8"
-            ) as file:
+            conn = sqlite3.connect(
+                str(STUDENT_DB_FILE),
+                timeout=10
+            )
+            conn.row_factory = sqlite3.Row
 
-                for line in file:
+            table = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='rfid_tags'"
+            ).fetchone()
 
-                    line = line.strip()
+            if table is None:
+                conn.close()
+                return records
 
-                    if not line:
-                        continue
+            rows = conn.execute("""
+                SELECT timestamp, round, token, epc,
+                       std_id, seq, fullname
+                FROM rfid_tags
+                ORDER BY id ASC
+            """).fetchall()
 
+            conn.close()
 
-                    parts = line.split(
-                        "\t"
+            for row in rows:
+                epc = normalize_rfid(
+                    row["epc"]
+                )
+
+                if not epc:
+                    continue
+
+                round_name = normalize_text(
+                    row["round"]
+                ).upper()
+
+                token = normalize_text(
+                    row["token"]
+                )
+
+                # รองรับข้อมูลเก่าที่ round อาจว่าง
+                if not re.fullmatch(
+                    r"R(?:10|[1-9])",
+                    round_name
+                ):
+                    round_name = ""
+
+                    token_key = normalize_rfid(
+                        token
                     )
 
+                    for r, t in self.round_tokens.items():
+                        if normalize_rfid(t) == token_key:
+                            round_name = r
+                            break
 
-                    if len(parts) < 3:
-                        continue
-
-
-                    timestamp = (
-                        parts[0].strip()
+                records.append({
+                    "timestamp": normalize_text(
+                        row["timestamp"]
+                    ),
+                    "token": token,
+                    "round": round_name,
+                    "epc": epc,
+                    "std_id": normalize_text(
+                        row["std_id"]
+                    ),
+                    "seq": normalize_text(
+                        row["seq"]
+                    ),
+                    "fullname": normalize_text(
+                        row["fullname"]
                     )
-
-                    token_or_round = (
-                        parts[1].strip()
-                    )
-
-                    epc = normalize_rfid(
-                        parts[2]
-                    )
-
-
-                    if not epc:
-                        continue
-
-
-                    round_key = (
-                        token_or_round.upper()
-                    )
-
-
-                    if re.fullmatch(
-                        r"R(?:10|[1-9])",
-                        round_key
-                    ):
-
-                        round_name = (
-                            round_key
-                        )
-
-                    else:
-
-                        round_name = (
-                            token_to_round.get(
-                                normalize_rfid(
-                                    token_or_round
-                                ),
-                                ""
-                            )
-                        )
-
-
-                    records.append(
-                        {
-                            "timestamp": timestamp,
-                            "token": token_or_round,
-                            "round": round_name,
-                            "epc": epc
-                        }
-                    )
-
+                })
 
         except Exception as e:
-
             print(
-                "RFID log error:",
+                "RFID DB log error:",
                 e
             )
 
-
         return records
+
+
+    def save_rfid_training_log(
+        self,
+        epc,
+        round_name,
+        round_token,
+        read_time,
+        std_id="",
+        seq="",
+        fullname=""
+    ):
+        """
+        บันทึกการเข้าสแกน/เข้าซ้อมลง student.db
+
+        1 RFID ที่ผ่าน Passage Mode จะถูกบันทึก 1 ครั้ง
+        เมื่อคน/Tag หายจาก Reader แล้วกลับมาใหม่
+        จึงจะเกิดรายการใหม่
+        """
+
+        try:
+            conn = sqlite3.connect(
+                str(STUDENT_DB_FILE),
+                timeout=10
+            )
+
+            timestamp = datetime.fromtimestamp(
+                read_time
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            created_at = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            conn.execute("""
+                INSERT INTO rfid_tags (
+                    timestamp,
+                    round,
+                    token,
+                    epc,
+                    std_id,
+                    seq,
+                    fullname,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                timestamp,
+                normalize_text(
+                    round_name
+                ).upper(),
+                normalize_text(
+                    round_token
+                ),
+                normalize_rfid(epc),
+                normalize_text(std_id),
+                normalize_text(seq),
+                normalize_text(fullname),
+                created_at
+            ))
+
+            conn.commit()
+            conn.close()
+
+            return True
+
+        except Exception as e:
+            print(
+                "RFID training log error:",
+                e
+            )
+            return False
 
 
     # ========================================================
@@ -1444,7 +1622,7 @@ class MainWindow(QMainWindow):
         self.api_round_token_value = QLineEdit()
         self.api_round_token_value.setReadOnly(True)
         self.api_round_token_value.setPlaceholderText(
-            "Token จาก round.txt"
+            "Token จาก student.db"
         )
         parameter_layout.addWidget(
             self.api_round_token_value, 0, 3
@@ -1512,11 +1690,40 @@ class MainWindow(QMainWindow):
         )
         control_layout.addWidget(self.api_reset_button)
 
+        self.api_bulk_button = QPushButton("โหลดข้อมูลรอบที่ R1")
+        self.api_bulk_button.clicked.connect(
+            self.api_load_selected_round
+        )
+        self.api_bulk_button.setToolTip(
+            "โหลดและส่งข้อมูล RFID เฉพาะรอบที่เลือกในรายการ round จนกว่าจะครบ"
+        )
+        control_layout.addWidget(self.api_bulk_button)
+
+        self.api_bulk_stop_button = QPushButton("หยุดรอบที่ R1")
+        self.api_bulk_stop_button.setEnabled(False)
+        self.api_bulk_stop_button.clicked.connect(
+            self.api_stop_bulk_round
+        )
+        self.api_bulk_stop_button.setToolTip(
+            "หยุดการส่งข้อมูลย้อนหลังของรอบที่กำลังโหลด โดยไม่ปิดโปรแกรม"
+        )
+        control_layout.addWidget(self.api_bulk_stop_button)
+
         self.api_view_json_button = QPushButton("ดู JSON")
         self.api_view_json_button.clicked.connect(
             self.show_api_json
         )
         control_layout.addWidget(self.api_view_json_button)
+
+        # เคลียร์ API Log เฉพาะรายการที่แสดงบนหน้าจอ
+        self.api_clear_log_button = QPushButton("เคลียร์ Log")
+        self.api_clear_log_button.clicked.connect(
+            self.clear_api_log
+        )
+        self.api_clear_log_button.setToolTip(
+            "ล้างรายการ API Log ที่แสดงบนหน้าจอ โดยไม่ลบข้อมูล RFID ใน student.db"
+        )
+        control_layout.addWidget(self.api_clear_log_button)
 
         control_layout.addStretch()
 
@@ -1683,6 +1890,16 @@ class MainWindow(QMainWindow):
         self.api_round_token_value.setText(
             round_token
         )
+
+        if hasattr(self, "api_bulk_button") and not self.api_bulk_running:
+            self.api_bulk_button.setText(
+                f"โหลดข้อมูลรอบที่ {round_name}"
+            )
+
+        if hasattr(self, "api_bulk_stop_button") and not self.api_bulk_running:
+            self.api_bulk_stop_button.setText(
+                f"หยุดรอบที่ {round_name}"
+            )
 
 
     def api_regenerate_token(self):
@@ -2577,6 +2794,399 @@ class MainWindow(QMainWindow):
 
 
     # ========================================================
+    # API BULK LOAD SELECTED ROUND
+    # ========================================================
+
+    def api_load_selected_round(self):
+        """
+        โหลดข้อมูล RFID ของรอบที่เลือกจาก student.db
+
+        หลักการ:
+        - Group ตามรอบ R1/R2/R3/R4/R5
+        - ในแต่ละรอบ ใช้ RFID/EPC ไม่ซ้ำกันเพียง 1 คน
+        - ถ้า RFID เดิมถูกอ่านหลายครั้ง ให้เลือก "รายการแรก" ที่บันทึกใน DB
+        - ไม่สนใจเวลาในการคัดเลือกข้อมูล
+        - จากนั้นส่งรายการที่ได้ทั้งหมดเข้า API ทีละรายการจนเสร็จ
+
+        ตัวอย่าง:
+            R2 มี log 2,000 รายการ
+            แต่มีนักศึกษาที่ไม่ซ้ำกัน 472 คน
+            ระบบจะสร้างคิว 472 รายการ แล้วส่ง 472 รายการ
+        """
+
+        if self.api_bulk_running:
+            return
+
+        if not getattr(self, "api_authenticated", False):
+            QMessageBox.warning(
+                self,
+                "API",
+                "กรุณา Authen ก่อนโหลดข้อมูล"
+            )
+            return
+
+        selected_round = (
+            self.api_round_value.currentText()
+            .strip()
+            .upper()
+        )
+
+        if selected_round not in ("R1", "R2", "R3", "R4", "R5"):
+            QMessageBox.warning(
+                self,
+                "API",
+                "กรุณาเลือกรอบ R1-R5"
+            )
+            return
+
+        round_token = (
+            self.round_tokens.get(selected_round, "")
+            .strip()
+        )
+
+        if not round_token:
+            QMessageBox.warning(
+                self,
+                "API",
+                f"ไม่พบ Round Token ของ {selected_round}"
+            )
+            return
+
+        room = self.api_room_token_edit.text().strip()
+        if not room:
+            QMessageBox.warning(
+                self,
+                "API",
+                "กรุณาระบุ room ก่อนโหลดข้อมูล"
+            )
+            return
+
+        if not STUDENT_DB_FILE.exists():
+            QMessageBox.information(
+                self,
+                "โหลดข้อมูล",
+                "ไม่พบ student.db"
+            )
+            return
+
+        # ถ้ากำลังส่งแบบต่อเนื่อง ให้หยุดก่อน
+        if self.api_running:
+            self.stop_api_sender()
+
+        queue = []
+
+        try:
+            conn = sqlite3.connect(
+                str(STUDENT_DB_FILE),
+                timeout=10
+            )
+            conn.row_factory = sqlite3.Row
+
+            # -----------------------------------------------------
+            # เลือก "ครั้งแรก" ของ RFID แต่ละตัวในรอบนั้น
+            # โดยใช้ id ซึ่งเป็นลำดับการบันทึกใน rfid_tags
+            #
+            # รองรับทั้งข้อมูลใหม่ที่มี round = R1/R2/... และ
+            # ข้อมูลที่อาจเก็บ round ว่าง แต่มี token ตรงกับรอบ
+            # -----------------------------------------------------
+            rows = conn.execute("""
+                SELECT r.timestamp,
+                       r.token,
+                       r.epc,
+                       r.std_id,
+                       r.seq,
+                       r.fullname
+                FROM rfid_tags r
+                INNER JOIN (
+                    SELECT epc, MIN(id) AS first_id
+                    FROM rfid_tags
+                    WHERE epc IS NOT NULL
+                      AND TRIM(epc) <> ''
+                      AND (
+                          UPPER(TRIM(round)) = ?
+                          OR TRIM(token) = ?
+                      )
+                    GROUP BY epc
+                ) first_row
+                    ON first_row.first_id = r.id
+                ORDER BY r.id ASC
+            """, (
+                selected_round,
+                round_token
+            )).fetchall()
+
+            # จำนวน log ทั้งหมดของรอบ เพื่อแสดงให้ผู้ใช้เห็นว่า
+            # จากข้อมูลซ้ำจำนวนมาก เหลือผู้เข้าร่วมจริงกี่คน
+            total_logs = conn.execute("""
+                SELECT COUNT(*)
+                FROM rfid_tags
+                WHERE epc IS NOT NULL
+                  AND TRIM(epc) <> ''
+                  AND (
+                      UPPER(TRIM(round)) = ?
+                      OR TRIM(token) = ?
+                  )
+            """, (
+                selected_round,
+                round_token
+            )).fetchone()[0]
+
+            conn.close()
+
+            for row in rows:
+                epc = normalize_rfid(row["epc"])
+                if not epc:
+                    continue
+
+                queue.append({
+                    "timestamp": normalize_text(row["timestamp"]),
+                    "token": normalize_text(row["token"]) or round_token,
+                    "epc": epc,
+                    "std_id": normalize_text(row["std_id"]),
+                    "seq": normalize_text(row["seq"]),
+                    "fullname": normalize_text(row["fullname"])
+                })
+
+        except Exception as e:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+            QMessageBox.critical(
+                self,
+                "โหลดข้อมูลไม่สำเร็จ",
+                f"อ่าน RFID log จาก student.db ไม่ได้:\n{e}"
+            )
+            return
+
+        self.api_bulk_queue = queue
+        self.api_bulk_index = 0
+        self.api_bulk_round = selected_round
+        self.api_bulk_total = len(queue)
+        self.api_bulk_success = 0
+        self.api_bulk_failed = 0
+        self.api_bulk_running = True
+
+        self.api_bulk_button.setEnabled(False)
+        self.api_bulk_stop_button.setEnabled(True)
+        self.api_bulk_stop_button.setText(
+            f"หยุดรอบที่ {selected_round}"
+        )
+        self.api_round_value.setEnabled(False)
+        self.api_start_button.setEnabled(False)
+        self.api_reset_button.setEnabled(False)
+
+        if self.api_bulk_total == 0:
+            self.api_bulk_running = False
+            self.api_bulk_button.setEnabled(True)
+            self.api_bulk_stop_button.setEnabled(False)
+            self.api_round_value.setEnabled(True)
+            self.api_start_button.setEnabled(True)
+            self.api_reset_button.setEnabled(True)
+
+            self.api_bulk_button.setText(
+                f"โหลดข้อมูลรอบที่ {selected_round}"
+            )
+            self.api_status_label.setText(
+                f"สถานะ: {selected_round} ไม่มีข้อมูล"
+            )
+            self.api_http_status_label.setText("HTTP: -")
+            return
+
+        self.api_status_label.setText(
+            f"สถานะ: เตรียมส่ง {selected_round} "
+            f"{self.api_bulk_total:,} คน "
+            f"(จาก log {total_logs:,} รายการ)"
+        )
+        self.api_http_status_label.setText(
+            f"คัดเลือกครั้งแรกของ RFID แต่ละคน | พร้อมส่ง {self.api_bulk_total:,} รายการ"
+        )
+        self.api_http_status_label.setStyleSheet(
+            "font-weight: bold; color: #2563eb;"
+        )
+
+        # เริ่มส่งทันที 1 รายการ
+        self.api_bulk_send_next()
+        if self.api_bulk_running:
+            self.api_bulk_timer.start()
+
+    def api_bulk_send_next(self):
+        """ส่งรายการในคิวของรอบที่เลือกทีละรายการ"""
+
+        if not self.api_bulk_running:
+            self.api_bulk_timer.stop()
+            return
+
+        if self.api_bulk_index >= self.api_bulk_total:
+            self.api_bulk_finish()
+            return
+
+        record = self.api_bulk_queue[self.api_bulk_index]
+        epc = record.get("epc", "")
+
+        # ใช้ข้อมูลนักศึกษาที่ถูกบันทึกมากับรายการแรกของ RFID ก่อน
+        # ถ้าไม่มี std_id จึงค่อย fallback ไป lookup ใน RAM
+        std_id = normalize_text(record.get("std_id", ""))
+        if not std_id:
+            student = getattr(self, "student_by_rfid", {}).get(epc)
+            if student is not None:
+                std_id = normalize_text(
+                    student.get("std_id", "")
+                )
+
+        round_name = self.api_bulk_round
+
+        self.api_std_id_value.setText(
+            std_id or "-"
+        )
+
+        self.api_code_value.setText(
+            epc
+        )
+
+        success, result = self.api_call(
+            round_name,
+            std_id,
+            epc
+        )
+
+        timestamp = record.get("timestamp", "").strip()
+        if not timestamp:
+            timestamp = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+        self.api_add_log(
+            timestamp,
+            round_name,
+            std_id,
+            epc,
+            result
+        )
+
+        if success:
+            self.api_bulk_success += 1
+            self.api_sent_count += 1
+            self.api_sent_label.setText(
+                f"ส่งแล้ว: {self.api_sent_count:,}"
+            )
+        else:
+            self.api_bulk_failed += 1
+
+        self.api_bulk_index += 1
+
+        current = self.api_bulk_index
+        total = self.api_bulk_total
+
+        if success:
+            self.api_status_label.setText(
+                f"สถานะ: กำลังโหลด {round_name} "
+                f"{current}/{total} | สำเร็จ {self.api_bulk_success}"
+            )
+        else:
+            self.api_status_label.setText(
+                f"สถานะ: กำลังโหลด {round_name} "
+                f"{current}/{total} | สำเร็จ {self.api_bulk_success} "
+                f"| ล้มเหลว {self.api_bulk_failed}"
+            )
+
+        if current >= total:
+            self.api_bulk_finish()
+
+
+    def api_stop_bulk_round(self):
+        """หยุดการโหลด/ส่งข้อมูลย้อนหลังของรอบที่กำลังทำงาน"""
+
+        if not self.api_bulk_running:
+            return
+
+        round_name = self.api_bulk_round or self.api_round_value.currentText().strip().upper()
+        current = self.api_bulk_index
+        total = self.api_bulk_total
+        success = self.api_bulk_success
+        failed = self.api_bulk_failed
+
+        self.api_bulk_running = False
+        self.api_bulk_timer.stop()
+
+        self.api_bulk_button.setEnabled(True)
+        self.api_bulk_stop_button.setEnabled(False)
+        self.api_bulk_stop_button.setText(
+            f"หยุดรอบที่ {round_name}"
+        )
+        self.api_round_value.setEnabled(True)
+        self.api_start_button.setEnabled(True)
+        self.api_reset_button.setEnabled(True)
+
+        self.api_status_label.setText(
+            f"สถานะ: ⏹ หยุดโหลดรอบ {round_name} "
+            f"ที่ {current}/{total} | สำเร็จ {success} | ล้มเหลว {failed}"
+        )
+        self.api_http_status_label.setText(
+            "HTTP: หยุดโดยผู้ใช้"
+        )
+        self.api_http_status_label.setStyleSheet(
+            "font-weight: bold; color: #d97706;"
+        )
+
+        self.api_bulk_queue = []
+        self.api_bulk_index = 0
+
+
+    def api_bulk_finish(self):
+        """จบการโหลดข้อมูลรอบนั้นและแสดงผลชัดเจนว่าเสร็จแล้ว"""
+
+        self.api_bulk_timer.stop()
+
+        round_name = self.api_bulk_round
+        total = self.api_bulk_total
+        success = self.api_bulk_success
+        failed = self.api_bulk_failed
+
+        self.api_bulk_running = False
+
+        self.api_bulk_button.setEnabled(True)
+        self.api_bulk_stop_button.setEnabled(False)
+        self.api_bulk_stop_button.setText(
+            f"หยุดรอบที่ {round_name}"
+        )
+        self.api_round_value.setEnabled(True)
+        self.api_start_button.setEnabled(True)
+        self.api_reset_button.setEnabled(True)
+
+        self.api_bulk_button.setText(
+            f"โหลดข้อมูลรอบที่ {round_name}"
+        )
+
+        if failed == 0:
+            self.api_status_label.setText(
+                f"สถานะ: ✓ โหลดรอบ {round_name} เสร็จแล้ว "
+                f"({success}/{total} รายการ)"
+            )
+            self.api_http_status_label.setText(
+                "HTTP: เสร็จสิ้น"
+            )
+            self.api_http_status_label.setStyleSheet(
+                "font-weight: bold; color: #15803d;"
+            )
+        else:
+            self.api_status_label.setText(
+                f"สถานะ: ⚠ โหลดรอบ {round_name} เสร็จแล้ว "
+                f"สำเร็จ {success}/{total} | ล้มเหลว {failed}"
+            )
+            self.api_http_status_label.setText(
+                f"HTTP: มีข้อผิดพลาด {failed} รายการ"
+            )
+            self.api_http_status_label.setStyleSheet(
+                "font-weight: bold; color: #dc2626;"
+            )
+
+        self.api_bulk_queue = []
+        self.api_bulk_index = 0
+
+
+    # ========================================================
     # API STOP
     # ========================================================
 
@@ -2715,7 +3325,7 @@ class MainWindow(QMainWindow):
                 "",
                 "",
                 "",
-                f"อ่าน rfid_tags.txt ไม่ได้: {e}"
+                f"อ่าน RFID log จาก student.db ไม่ได้: {e}"
             )
 
             return None
@@ -3579,6 +4189,34 @@ class MainWindow(QMainWindow):
     # API LOG
     # ========================================================
 
+    def clear_api_log(self):
+        """ล้าง API Log บนหน้าจอเท่านั้น ไม่ลบข้อมูล RFID ใน student.db"""
+
+        reply = QMessageBox.question(
+            self,
+            "ยืนยันการเคลียร์ Log",
+            "ต้องการเคลียร์ API Log ที่แสดงบนหน้าจอทั้งหมดหรือไม่?\n\n"
+            "ข้อมูล RFID ใน student.db จะไม่ถูกลบ",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.api_log.setRowCount(0)
+
+        if hasattr(self, "api_log_json_data"):
+            self.api_log_json_data.clear()
+
+        self.api_http_status_label.setText("HTTP: -")
+        self.api_http_status_label.setStyleSheet(
+            "font-weight: bold; color: #64748b;"
+        )
+        self.api_sent_label.setText("ส่งแล้ว: 0")
+        self.api_status_label.setText("สถานะ: Log ถูกเคลียร์แล้ว")
+
     def api_add_log(
         self,
         timestamp,
@@ -3829,17 +4467,63 @@ class MainWindow(QMainWindow):
         connection_layout.setHorizontalSpacing(8)
         connection_layout.setVerticalSpacing(6)
 
-        connection_layout.addWidget(QLabel("IP Address:"), 0, 0)
+        connection_layout.addWidget(QLabel("Connection:"), 0, 0)
+
+        self.connection_type_combo = QComboBox()
+        self.connection_type_combo.addItems(["TCP/IP", "COM Port"])
+        self.connection_type_combo.setFixedWidth(100)
+        self.connection_type_combo.currentIndexChanged.connect(
+            self.on_connection_type_changed
+        )
+        connection_layout.addWidget(self.connection_type_combo, 0, 1)
+
+        self.ip_label = QLabel("IP Address:")
+        connection_layout.addWidget(self.ip_label, 0, 2)
 
         self.ip_edit = QLineEdit(DEFAULT_IP)
         self.ip_edit.setFixedWidth(180)
-        connection_layout.addWidget(self.ip_edit, 0, 1)
+        connection_layout.addWidget(self.ip_edit, 0, 3)
 
-        connection_layout.addWidget(QLabel("Port:"), 0, 2)
+        self.port_label = QLabel("Port:")
+        connection_layout.addWidget(self.port_label, 0, 4)
 
         self.port_edit = QLineEdit(str(DEFAULT_PORT))
         self.port_edit.setFixedWidth(80)
-        connection_layout.addWidget(self.port_edit, 0, 3)
+        connection_layout.addWidget(self.port_edit, 0, 5)
+
+        self.com_label = QLabel("COM:")
+        connection_layout.addWidget(self.com_label, 0, 6)
+
+        self.com_combo = QComboBox()
+        self.com_combo.setMinimumWidth(150)
+        self.com_combo.setEditable(False)
+        connection_layout.addWidget(self.com_combo, 0, 7)
+
+        self.refresh_com_button = QPushButton("↻")
+        self.refresh_com_button.setFixedWidth(38)
+        self.refresh_com_button.setToolTip("Refresh COM Port")
+        self.refresh_com_button.clicked.connect(self.refresh_com_ports)
+        connection_layout.addWidget(self.refresh_com_button, 0, 8)
+
+        self.baud_label = QLabel("Baud:")
+        connection_layout.addWidget(self.baud_label, 0, 9)
+
+        self.baud_combo = QComboBox()
+        self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200", "230400"])
+        self.baud_combo.setCurrentText(str(DEFAULT_BAUDRATE))
+        self.baud_combo.setFixedWidth(90)
+        connection_layout.addWidget(self.baud_combo, 0, 10)
+
+        connection_layout.addWidget(QLabel("RF Power:"), 0, 11)
+
+        self.rf_power_combo = QComboBox()
+        self.rf_power_combo.addItems([f"{dbm} dBm" for dbm in range(15, 31)])
+        self.rf_power_combo.setCurrentText(f"{RF_POWER_DBM} dBm")
+        self.rf_power_combo.setToolTip(
+            "เลือกกำลังส่ง RFID ตั้งแต่ 15-30 dBm"
+        )
+        self.rf_power_combo.setMinimumWidth(105)
+        connection_layout.addWidget(self.rf_power_combo, 0, 12)
 
         self.connect_button = QPushButton("Connect")
         self.connect_button.setMinimumWidth(100)
@@ -3860,22 +4544,22 @@ class MainWindow(QMainWindow):
             }
         """)
         self.connect_button.clicked.connect(self.connect_reader)
-        connection_layout.addWidget(self.connect_button, 0, 4)
+        connection_layout.addWidget(self.connect_button, 0, 13)
 
         self.close_button = QPushButton("Close")
         self.close_button.setMinimumWidth(100)
         self.close_button.setEnabled(False)
         self.close_button.clicked.connect(self.close_reader)
-        connection_layout.addWidget(self.close_button, 0, 5)
+        connection_layout.addWidget(self.close_button, 0, 14)
 
-        connection_layout.addWidget(QLabel("Status:"), 0, 6)
+        connection_layout.addWidget(QLabel("Status:"), 0, 15)
 
         self.status_label = QLabel("Disconnected")
         self.status_label.setMinimumWidth(180)
         self.status_label.setStyleSheet("font-weight: bold;")
-        connection_layout.addWidget(self.status_label, 0, 7)
+        connection_layout.addWidget(self.status_label, 0, 16)
 
-        connection_layout.setColumnStretch(7, 1)
+        connection_layout.setColumnStretch(16, 1)
 
         main_layout.addWidget(connection_box)
 
@@ -4083,7 +4767,7 @@ class MainWindow(QMainWindow):
             "500ms",
             "1000ms"
         ])
-        self.interval_combo.setCurrentText("50ms")
+        self.interval_combo.setCurrentText("200ms")
         query_layout.addWidget(self.interval_combo)
 
         self.query_button = QPushButton("Query Tag")
@@ -4201,6 +4885,9 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(bottom_layout)
 
+        self.refresh_com_ports()
+        self.on_connection_type_changed(self.connection_type_combo.currentIndex())
+
         self.round_changed(1)
 
     # ========================================================
@@ -4242,10 +4929,68 @@ class MainWindow(QMainWindow):
 
 
     # ========================================================
+    # CONNECTION TYPE / COM PORT
+    # ========================================================
+
+    def refresh_com_ports(self):
+        current = self.com_combo.currentData()
+        self.com_combo.clear()
+
+        if list_ports is None:
+            self.com_combo.addItem("ติดตั้ง pyserial ก่อน", "")
+            return
+
+        ports = list(list_ports.comports())
+        ports.sort(key=lambda p: p.device)
+
+        for port in ports:
+            description = port.description or "Unknown device"
+            manufacturer = port.manufacturer or ""
+            text = f"{port.device} - {description}"
+            if manufacturer:
+                text += f" ({manufacturer})"
+            self.com_combo.addItem(text, port.device)
+
+        if current:
+            idx = self.com_combo.findData(current)
+            if idx >= 0:
+                self.com_combo.setCurrentIndex(idx)
+
+        if self.com_combo.count() == 0:
+            self.com_combo.addItem("ไม่พบ COM Port", "")
+
+    def on_connection_type_changed(self, index):
+        is_com = index == 1
+
+        self.ip_label.setVisible(not is_com)
+        self.ip_edit.setVisible(not is_com)
+        self.port_label.setVisible(not is_com)
+        self.port_edit.setVisible(not is_com)
+
+        self.com_label.setVisible(is_com)
+        self.com_combo.setVisible(is_com)
+        self.refresh_com_button.setVisible(is_com)
+        self.baud_label.setVisible(is_com)
+        self.baud_combo.setVisible(is_com)
+
+        if is_com:
+            self.refresh_com_ports()
+
+
+    # ========================================================
     # CONNECT
     # ========================================================
 
     def connect_reader(self):
+
+        # การ Connect ใหม่ถือเป็นการทำงานปกติ
+        self.manual_reader_close = False
+
+        connection_type = (
+            "COM"
+            if self.connection_type_combo.currentIndex() == 1
+            else "TCP"
+        )
 
         ip = (
             self.ip_edit
@@ -4253,24 +4998,44 @@ class MainWindow(QMainWindow):
             .strip()
         )
 
+        port = DEFAULT_PORT
+        com_port = ""
+        baudrate = DEFAULT_BAUDRATE
 
-        try:
+        if connection_type == "COM":
+            com_port = self.com_combo.currentData() or ""
+            if not com_port:
+                QMessageBox.warning(
+                    self,
+                    "COM Port",
+                    "กรุณาเลือก COM Port ก่อนเชื่อมต่อ"
+                )
+                return
 
-            port = int(
-                self.port_edit
-                .text()
-                .strip()
-            )
+            try:
+                baudrate = int(self.baud_combo.currentText())
+            except ValueError:
+                QMessageBox.warning(
+                    self,
+                    "Baud Rate",
+                    "Baud Rate ไม่ถูกต้อง"
+                )
+                return
 
-        except Exception:
-
-            QMessageBox.warning(
-                self,
-                "Error",
-                "Port ไม่ถูกต้อง"
-            )
-
-            return
+        else:
+            try:
+                port = int(
+                    self.port_edit
+                    .text()
+                    .strip()
+                )
+            except Exception:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "Port ไม่ถูกต้อง"
+                )
+                return
 
 
         interval = int(
@@ -4282,11 +5047,21 @@ class MainWindow(QMainWindow):
             )
         )
 
+        rf_power_dbm = int(
+            self.rf_power_combo
+            .currentText()
+            .replace(" dBm", "")
+        )
+
 
         self.worker = RFIDWorker(
             ip,
             port,
-            interval
+            interval,
+            rf_power_dbm,
+            connection_type,
+            com_port,
+            baudrate
         )
 
 
@@ -4335,9 +5110,13 @@ class MainWindow(QMainWindow):
             False
         )
 
-        self.port_edit.setEnabled(
-            False
-        )
+        self.port_edit.setEnabled(False)
+        self.connection_type_combo.setEnabled(False)
+        self.com_combo.setEnabled(False)
+        self.refresh_com_button.setEnabled(False)
+        self.baud_combo.setEnabled(False)
+
+        self.rf_power_combo.setEnabled(False)
 
 
     # ========================================================
@@ -4395,6 +5174,8 @@ class MainWindow(QMainWindow):
             self.round_token
         )
 
+        # เริ่มการผ่านชุดใหม่
+        self.passage_last_seen.clear()
 
         self.worker.start_scan()
 
@@ -4441,18 +5222,33 @@ class MainWindow(QMainWindow):
     ):
 
         # -----------------------------------------------------
+        # PASSAGE MODE
+        # Reader จะอ่าน tag เดิมหลายครั้งในขณะที่คนยังอยู่หน้าเสา
+        # รับเฉพาะครั้งแรก และอนุญาตให้อ่านใหม่เมื่อหายไป >= 3 วินาที
+        # -----------------------------------------------------
+        normalized_epc = normalize_rfid(epc)
+        now_ts = time.monotonic()
+        last_ts = self.passage_last_seen.get(normalized_epc)
+
+        if (
+            last_ts is not None
+            and (now_ts - last_ts) < self.passage_rearm_seconds
+        ):
+            return
+
+        self.passage_last_seen[normalized_epc] = now_ts
+        read_time = time.time()
+
+        # -----------------------------------------------------
         # หา Student จาก RFID
         # -----------------------------------------------------
         normalized_epc = normalize_rfid(epc)
 
-        student = None
-
-        for student_row in self.student_data:
-            if normalize_rfid(
-                student_row.get("rfid", "")
-            ) == normalized_epc:
-                student = student_row
-                break
+        # ค้นหาจาก Dictionary ใน RAM
+        # เร็วกว่าการวน student_data ทุกครั้ง
+        student = self.student_by_rfid.get(
+            normalized_epc
+        )
 
         std_id = ""
         seq = ""
@@ -4477,6 +5273,20 @@ class MainWindow(QMainWindow):
             )
 
         # -----------------------------------------------------
+        # บันทึกการเข้าสแกน/เข้าซ้อม
+        # -----------------------------------------------------
+        # ผ่าน Passage Mode มาแล้ว จึงถือเป็น 1 การเข้าสแกน
+        self.save_rfid_training_log(
+            epc=normalized_epc,
+            round_name=self.current_round,
+            round_token=self.round_token,
+            read_time=read_time,
+            std_id=std_id,
+            seq=seq,
+            fullname=fullname
+        )
+
+        # -----------------------------------------------------
         # RFID เดิม
         # -----------------------------------------------------
         if epc in self.tags:
@@ -4485,6 +5295,7 @@ class MainWindow(QMainWindow):
 
             data["times"] += 1
             data["rssi"] = rssi
+            data["last_read"] = read_time
 
             if std_id:
                 data["std_id"] = std_id
@@ -4498,9 +5309,13 @@ class MainWindow(QMainWindow):
             # -------------------------------------------------
             # ย้าย RFID ที่เพิ่งอ่านขึ้นแถวบนสุด
             # -------------------------------------------------
-            old_row = data["row"]
+            old_row = data.get("row", -1)
 
-            if old_row != 0:
+            # ถ้ารายการเก่าถูกซ่อนจากหน้าจอแล้ว row อาจเป็น -1
+            if not (0 <= old_row < self.table.rowCount()):
+                old_row = -1
+
+            if old_row > 0:
                 row_items = []
 
                 for col in range(self.table.columnCount()):
@@ -4622,7 +5437,8 @@ class MainWindow(QMainWindow):
                 "row": 0,
                 "std_id": std_id,
                 "seq": seq,
-                "fullname": fullname
+                "fullname": fullname,
+                "last_read": read_time
             }
 
             # อัปเดตเลข No. ใหม่ทั้งหมด
@@ -4689,7 +5505,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.latest_status_label.setText(
-                "⚠ อ่าน RFID ได้ แต่ไม่พบข้อมูล"
+                "⚠ อ่าน RFID ได้ แต่ไม่พบข้อมูลนักศึกษา"
             )
 
         detail_parts = [
@@ -4731,21 +5547,60 @@ class MainWindow(QMainWindow):
         self.last_label.setToolTip(latest_text)
 
         # -----------------------------------------------------
-        # เลื่อนไปด้านบนสุดเสมอ
+        # แสดงเฉพาะ 5 รายการล่าสุด
+        # ข้อมูลทั้งหมดใน self.tags ยังเก็บครบเหมือนเดิม
         # -----------------------------------------------------
+        self._refresh_latest_visible_rows()
+
+        # -----------------------------------------------------
+        # Update dashboard แบบ throttle
+        # ไม่อ่าน rfid_tags.txt และสร้าง card ใหม่ทุก tag
+        # -----------------------------------------------------
+        if not self.dashboard_refresh_timer.isActive():
+            self.dashboard_refresh_timer.start(500)
+
+
+    def _refresh_latest_visible_rows(self):
+        """แสดงเฉพาะ RFID 5 รายการล่าสุดบนหน้าจอ โดยไม่ลบข้อมูลจาก self.tags"""
+        latest = sorted(
+            self.tags.items(),
+            key=lambda item: item[1].get("last_read", 0),
+            reverse=True
+        )[:VISIBLE_LATEST_TAGS]
+
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.setRowCount(0)
+
+            for row, (epc, data) in enumerate(latest):
+                values = [
+                    str(row + 1),
+                    epc,
+                    str(data.get("std_id", "") or ""),
+                    str(data.get("seq", "") or ""),
+                    str(data.get("fullname", "") or ""),
+                    str(data.get("round", self.current_round) or ""),
+                    f"{int(data.get('length', 0)):02X}",
+                    str(data.get("times", 0))
+                ]
+
+                self.table.insertRow(row)
+                for col, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if col == 5:
+                        item.setToolTip(str(data.get("round_token", "")))
+                    self.table.setItem(row, col, item)
+
+                data["row"] = row
+
+            visible_epcs = {epc for epc, _ in latest}
+            for epc, data in self.tags.items():
+                if epc not in visible_epcs:
+                    data["row"] = -1
+        finally:
+            self.table.setUpdatesEnabled(True)
+
         self.table.scrollToTop()
-
-        # -----------------------------------------------------
-        # Update dashboard/result after new RFID
-        # -----------------------------------------------------
-        self.refresh_dashboard()
-
-        if hasattr(self, "result_table"):
-            try:
-                self.refresh_result()
-            except Exception:
-                pass
-
 
     # ========================================================
     # SEARCH EPC
@@ -4820,6 +5675,7 @@ class MainWindow(QMainWindow):
         )
 
         self.tags.clear()
+        self.passage_last_seen.clear()
 
 
         self.tags_label.setText(
@@ -5201,16 +6057,19 @@ class MainWindow(QMainWindow):
         title,
         count,
         row,
-        column=None
+        column=0
     ):
 
-        # รองรับทั้งการส่ง row, column แยกกัน
-        # และการส่งเป็น tuple (row, column)
-        if column is None and isinstance(row, tuple):
-            row, column = row
-
-        if column is None:
-            column = 0
+        # QGridLayout.addWidget() ต้องได้รับ row/column เป็น int
+        # ไม่รับ tuple จึงบังคับแปลงค่าให้เป็น int ที่นี่
+        try:
+            row = int(row)
+            column = int(column)
+        except (TypeError, ValueError):
+            raise TypeError(
+                f"Dashboard card position must be integers: "
+                f"row={row!r}, column={column!r}"
+            )
 
         card = QWidget()
 
@@ -5341,7 +6200,50 @@ class MainWindow(QMainWindow):
 
     def refresh_dashboard(self):
 
+        # อ่านจาก log ก่อน
         records = self.read_rfid_log()
+
+        # -----------------------------------------------------
+        # LIVE RFID
+        # เพิ่มข้อมูลจาก self.tags ทันที เพื่อให้ Dashboard
+        # และหน้าสรุปแยกอิสระอัปเดตทันทีขณะกำลังสแกน
+        # -----------------------------------------------------
+        live_epcs = {
+            normalize_rfid(
+                record.get("epc", "")
+            )
+            for record in records
+        }
+
+        for epc, data in getattr(
+            self,
+            "tags",
+            {}
+        ).items():
+
+            normalized_epc = normalize_rfid(epc)
+
+            if not normalized_epc:
+                continue
+
+            # ถ้า log มีอยู่แล้ว ไม่ต้องเพิ่มซ้ำ
+            if normalized_epc in live_epcs:
+                continue
+
+            records.append({
+                "timestamp": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "token": data.get(
+                    "round_token",
+                    self.round_token
+                ),
+                "round": data.get(
+                    "round",
+                    self.current_round
+                ),
+                "epc": normalized_epc
+            })
 
         round_filter = (
             self.dashboard_round_combo
@@ -5505,7 +6407,8 @@ class MainWindow(QMainWindow):
                 self.dashboard_round_cards,
                 name,
                 count,
-                (0, index - 1)
+                0,
+                index - 1
             )
 
         # -----------------------------------------------------
@@ -5614,117 +6517,205 @@ class MainWindow(QMainWindow):
         }
 
 
-    def show_dashboard_summary_popup(self):
-        """
-        เปิดหน้าสรุปจำนวนเป็น Extend Window อิสระ
-        สามารถวางบนจอที่ 2 ได้ และใช้งานหน้าหลักพร้อมกัน
-        """
+    def _clear_layout(self, layout):
+        """ล้าง widget/layout เดิมในหน้าสรุป เพื่อสร้างข้อมูลล่าสุด"""
+        while layout.count():
+            item = layout.takeAt(0)
 
-        # ถ้าเปิดอยู่แล้ว ให้เอาหน้าต่างเดิมขึ้นมา
-        if getattr(self, "_dashboard_summary_window", None) is not None:
-            try:
-                if self._dashboard_summary_window.isVisible():
-                    self._dashboard_summary_window.showNormal()
-                    self._dashboard_summary_window.raise_()
-                    self._dashboard_summary_window.activateWindow()
-                    return
-            except RuntimeError:
-                self._dashboard_summary_window = None
+            widget = item.widget()
+            child_layout = item.layout()
 
-        window = QWidget(None)
-        window.setWindowTitle("ระบบตรวจนับบัณฑิต - สรุปจำนวน")
-        window.setWindowFlag(Qt.WindowType.Window, True)
-        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        window.resize(1200, 800)
-        window.setMinimumSize(850, 600)
+            if widget is not None:
+                widget.deleteLater()
 
-        self._dashboard_summary_window = window
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
 
-        # -----------------------------------------------------
-        # Main layout
-        # -----------------------------------------------------
-        outer = QVBoxLayout(window)
-        outer.setContentsMargins(16, 12, 16, 12)
-        outer.setSpacing(10)
+    def _make_summary_box(
+        self,
+        title_text,
+        items,
+        bg,
+        border
+    ):
+        """สร้างกล่องสรุปสำหรับหน้าต่าง Extend"""
+        box = QGroupBox(title_text)
 
-        # -----------------------------------------------------
-        # Header
-        # -----------------------------------------------------
-        header = QHBoxLayout()
+        box.setMinimumHeight(260)
 
-        title = QLabel("สรุปจำนวนผู้เข้าร่วม")
-        title.setStyleSheet("""
-            QLabel {
-                font-size: 24px;
+        box.setStyleSheet(
+            f"""
+            QGroupBox {{
+                font-size: 14px;
                 font-weight: bold;
-                color: #17324d;
-            }
-        """)
-
-        header.addWidget(title)
-        header.addStretch()
-
-        close_btn = QPushButton("ปิดหน้าสรุป")
-        close_btn.setMinimumSize(120, 38)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                border: 1px solid #e5bcbc;
-                border-radius: 7px;
-                background: #fff1f1;
-                color: #c62828;
-                font-weight: bold;
-                padding: 6px 14px;
-            }
-            QPushButton:hover {
-                background: #ffe2e2;
-            }
-        """)
-        close_btn.clicked.connect(window.close)
-
-        header.addWidget(close_btn)
-        outer.addLayout(header)
-
-        # -----------------------------------------------------
-        # Current filters
-        # -----------------------------------------------------
-        filters_text = (
-            f"รอบ: {self.dashboard_round_combo.currentText()}    |    "
-            f"คณะ: {self.dashboard_faculty_combo.currentText()}    |    "
-            f"สาขาวิชา: {self.dashboard_major_combo.currentText()}    |    "
-            f"ชื่อปริญญา: {self.dashboard_educational_combo.currentText()}"
+                color: #374151;
+                border: 1px solid {border};
+                border-radius: 10px;
+                margin-top: 8px;
+                padding-top: 12px;
+                background: #ffffff;
+            }}
+            """
         )
 
-        filters_label = QLabel(filters_text)
-        filters_label.setWordWrap(True)
-        filters_label.setStyleSheet("""
-            QLabel {
-                border: 1px solid #d7e0e8;
-                border-radius: 8px;
-                background: #f7fafc;
-                color: #475569;
-                padding: 9px 12px;
-                font-size: 13px;
-            }
-        """)
-        outer.addWidget(filters_label)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(
+            QScrollArea.Shape.NoFrame
+        )
+
+        widget = QWidget()
+        widget.setStyleSheet(
+            "background: transparent;"
+        )
+
+        item_grid = QGridLayout(widget)
+
+        item_grid.setContentsMargins(
+            8, 8, 8, 8
+        )
+
+        item_grid.setHorizontalSpacing(10)
+        item_grid.setVerticalSpacing(10)
+
+        if not items:
+
+            empty = QLabel("ไม่มีข้อมูล")
+
+            empty.setAlignment(
+                Qt.AlignmentFlag.AlignCenter
+            )
+
+            empty.setStyleSheet(
+                """
+                font-size: 16px;
+                color: #64748b;
+                padding: 30px;
+                """
+            )
+
+            item_grid.addWidget(
+                empty,
+                0,
+                0,
+                1,
+                2
+            )
+
+        else:
+
+            for idx, (name, count) in enumerate(
+                items
+            ):
+
+                card = QWidget()
+
+                card.setMinimumHeight(85)
+
+                card.setStyleSheet(
+                    f"""
+                    QWidget {{
+                        border: 1px solid {border};
+                        border-radius: 9px;
+                        background: {bg};
+                    }}
+
+                    QLabel {{
+                        border: none;
+                        background: transparent;
+                        color: #334155;
+                    }}
+                    """
+                )
+
+                card_layout = QVBoxLayout(card)
+
+                card_layout.setContentsMargins(
+                    8, 7, 8, 7
+                )
+
+                name_label = QLabel(
+                    str(name)
+                )
+
+                name_label.setAlignment(
+                    Qt.AlignmentFlag.AlignCenter
+                )
+
+                name_label.setWordWrap(True)
+
+                name_label.setStyleSheet(
+                    """
+                    font-size: 12px;
+                    font-weight: bold;
+                    """
+                )
+
+                count_label = QLabel(
+                    f"{count:,}"
+                )
+
+                count_label.setAlignment(
+                    Qt.AlignmentFlag.AlignCenter
+                )
+
+                count_label.setStyleSheet(
+                    """
+                    font-size: 23px;
+                    font-weight: bold;
+                    """
+                )
+
+                card_layout.addWidget(
+                    name_label
+                )
+
+                card_layout.addWidget(
+                    count_label
+                )
+
+                item_grid.addWidget(
+                    card,
+                    idx // 2,
+                    idx % 2
+                )
+
+        item_grid.setColumnStretch(0, 1)
+        item_grid.setColumnStretch(1, 1)
+
+        area.setWidget(widget)
+
+        box_layout = QVBoxLayout(box)
+        box_layout.addWidget(area)
+
+        return box
+
+    def _update_dashboard_summary_popup(self):
+        """
+        อัปเดตหน้าสรุป Extend โดยไม่ปิดหน้าต่าง
+        และไม่สร้างหน้าต่างใหม่
+        """
+
+        window = getattr(
+            self,
+            "_dashboard_summary_window",
+            None
+        )
+
+        if window is None:
+            return
+
+        try:
+            if not window.isVisible():
+                return
+        except RuntimeError:
+            self._dashboard_summary_window = None
+            return
 
         # -----------------------------------------------------
-        # Scroll area
+        # ดึงข้อมูลล่าสุด
         # -----------------------------------------------------
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-
-        content = QWidget()
-        content.setMinimumWidth(780)
-
-        grid = QGridLayout(content)
-        grid.setContentsMargins(4, 4, 4, 4)
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(14)
-
-        scroll.setWidget(content)
-        outer.addWidget(scroll, 1)
+        self.refresh_dashboard()
 
         data = getattr(
             self,
@@ -5739,11 +6730,330 @@ class MainWindow(QMainWindow):
         )
 
         # -----------------------------------------------------
-        # Total
+        # Filter text
         # -----------------------------------------------------
-        total_box = QGroupBox("จำนวนทั้งหมด")
-        total_box.setMinimumHeight(125)
-        total_box.setStyleSheet("""
+        filters_text = (
+            f"รอบ: {self.dashboard_round_combo.currentText()}"
+            f"    |    "
+            f"คณะ: {self.dashboard_faculty_combo.currentText()}"
+            f"    |    "
+            f"สาขาวิชา: {self.dashboard_major_combo.currentText()}"
+            f"    |    "
+            f"ชื่อปริญญา: "
+            f"{self.dashboard_educational_combo.currentText()}"
+        )
+
+        try:
+            if hasattr(
+                window,
+                "_summary_filters_label"
+            ):
+                window._summary_filters_label.setText(
+                    filters_text
+                )
+
+            # -------------------------------------------------
+            # Total
+            # -------------------------------------------------
+            if hasattr(
+                window,
+                "_summary_total_label"
+            ):
+                window._summary_total_label.setText(
+                    f"{data['total']:,}"
+                )
+
+        except RuntimeError:
+            # ป้องกัน timer callback ที่ค้างอยู่หลังปิดหน้าต่าง
+            try:
+                window._summary_timer.stop()
+            except Exception:
+                pass
+
+            self._dashboard_summary_window = None
+            return
+
+        # -----------------------------------------------------
+        # Summary Cards
+        # -----------------------------------------------------
+        if hasattr(
+            window,
+            "_summary_grid"
+        ):
+
+            grid = window._summary_grid
+
+            self._clear_layout(grid)
+
+            grid.addWidget(
+                self._make_summary_box(
+                    "จำนวนคนแต่ละรอบ",
+                    data["round"],
+                    "#EAF4FF",
+                    "#C9DFF5"
+                ),
+                1,
+                0
+            )
+
+            grid.addWidget(
+                self._make_summary_box(
+                    "จำนวนคนตามคณะ",
+                    data["faculty"],
+                    "#EEF9F0",
+                    "#CDE8D2"
+                ),
+                1,
+                1
+            )
+
+            grid.addWidget(
+                self._make_summary_box(
+                    "จำนวนคนตามสาขาวิชา",
+                    data["major"],
+                    "#FFF7E8",
+                    "#F1DFC0"
+                ),
+                2,
+                0
+            )
+
+            grid.addWidget(
+                self._make_summary_box(
+                    "จำนวนคนตามชื่อปริญญา",
+                    data["educational"],
+                    "#F7EEFF",
+                    "#DFD0F0"
+                ),
+                2,
+                1
+            )
+
+            grid.setColumnStretch(0, 1)
+            grid.setColumnStretch(1, 1)
+            grid.setRowStretch(1, 1)
+            grid.setRowStretch(2, 1)
+
+    def show_dashboard_summary_popup(self):
+        """
+        เปิดหน้าสรุปเป็น Extend Window อิสระ
+        สามารถลากไปจอที่ 2 ได้ และข้อมูลจะอัปเดต
+        แบบ LIVE โดยไม่ต้องปิด/เปิดหน้าต่างใหม่
+        """
+
+        # -----------------------------------------------------
+        # ถ้าเปิดอยู่แล้ว ให้เอาหน้าต่างเดิมขึ้นมา
+        # -----------------------------------------------------
+        if getattr(
+            self,
+            "_dashboard_summary_window",
+            None
+        ) is not None:
+
+            try:
+
+                if self._dashboard_summary_window.isVisible():
+
+                    self._dashboard_summary_window.showNormal()
+                    self._dashboard_summary_window.raise_()
+                    self._dashboard_summary_window.activateWindow()
+
+                    return
+
+            except RuntimeError:
+
+                self._dashboard_summary_window = None
+
+        # -----------------------------------------------------
+        # Independent Window
+        # -----------------------------------------------------
+        window = QWidget(None)
+
+        window.setWindowTitle(
+            "ระบบตรวจนับบัณฑิต - สรุปจำนวน"
+        )
+
+        window.setWindowFlag(
+            Qt.WindowType.Window,
+            True
+        )
+
+        window.setAttribute(
+            Qt.WidgetAttribute.WA_DeleteOnClose,
+            True
+        )
+
+        window.resize(
+            1200,
+            800
+        )
+
+        window.setMinimumSize(
+            850,
+            600
+        )
+
+        self._dashboard_summary_window = window
+
+        # -----------------------------------------------------
+        # Main Layout
+        # -----------------------------------------------------
+        outer = QVBoxLayout(window)
+
+        outer.setContentsMargins(
+            16,
+            12,
+            16,
+            12
+        )
+
+        outer.setSpacing(10)
+
+        # -----------------------------------------------------
+        # Header
+        # -----------------------------------------------------
+        header = QHBoxLayout()
+
+        title = QLabel(
+            "สรุปจำนวนผู้เข้าร่วม"
+        )
+
+        title.setStyleSheet(
+            """
+            QLabel {
+                font-size: 24px;
+                font-weight: bold;
+                color: #17324d;
+            }
+            """
+        )
+
+        header.addWidget(title)
+        header.addStretch()
+
+        close_btn = QPushButton(
+            "ปิดหน้าสรุป"
+        )
+
+        close_btn.setMinimumSize(
+            120,
+            38
+        )
+
+        close_btn.setStyleSheet(
+            """
+            QPushButton {
+                border: 1px solid #e5bcbc;
+                border-radius: 7px;
+                background: #fff1f1;
+                color: #c62828;
+                font-weight: bold;
+                padding: 6px 14px;
+            }
+
+            QPushButton:hover {
+                background: #ffe2e2;
+            }
+            """
+        )
+
+        close_btn.clicked.connect(
+            window.close
+        )
+
+        header.addWidget(
+            close_btn
+        )
+
+        outer.addLayout(
+            header
+        )
+
+        # -----------------------------------------------------
+        # Current Filters
+        # -----------------------------------------------------
+        filters_label = QLabel()
+
+        filters_label.setWordWrap(True)
+
+        filters_label.setStyleSheet(
+            """
+            QLabel {
+                border: 1px solid #d7e0e8;
+                border-radius: 8px;
+                background: #f7fafc;
+                color: #475569;
+                padding: 9px 12px;
+                font-size: 13px;
+            }
+            """
+        )
+
+        window._summary_filters_label = (
+            filters_label
+        )
+
+        outer.addWidget(
+            filters_label
+        )
+
+        # -----------------------------------------------------
+        # Scroll
+        # -----------------------------------------------------
+        scroll = QScrollArea()
+
+        scroll.setWidgetResizable(
+            True
+        )
+
+        scroll.setFrameShape(
+            QScrollArea.Shape.NoFrame
+        )
+
+        content = QWidget()
+
+        content.setMinimumWidth(
+            780
+        )
+
+        grid = QGridLayout(content)
+
+        grid.setContentsMargins(
+            4, 4, 4, 4
+        )
+
+        grid.setHorizontalSpacing(
+            14
+        )
+
+        grid.setVerticalSpacing(
+            14
+        )
+
+        window._summary_grid = grid
+
+        scroll.setWidget(
+            content
+        )
+
+        outer.addWidget(
+            scroll,
+            1
+        )
+
+        # -----------------------------------------------------
+        # Total Box
+        # -----------------------------------------------------
+        total_box = QGroupBox(
+            "จำนวนทั้งหมด"
+        )
+
+        total_box.setMinimumHeight(
+            125
+        )
+
+        total_box.setStyleSheet(
+            """
             QGroupBox {
                 font-size: 14px;
                 font-weight: bold;
@@ -5753,174 +7063,95 @@ class MainWindow(QMainWindow):
                 padding-top: 12px;
                 background: #f1f8fe;
             }
+
             QLabel {
                 border: none;
                 background: transparent;
             }
-        """)
+            """
+        )
 
-        total_layout = QVBoxLayout(total_box)
+        total_layout = QVBoxLayout(
+            total_box
+        )
 
-        total_count = QLabel(f"{data['total']:,}")
-        total_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        total_count.setStyleSheet("""
+        total_count = QLabel(
+            "0"
+        )
+
+        total_count.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+        total_count.setStyleSheet(
+            """
             font-size: 38px;
             font-weight: bold;
             color: #17324d;
-        """)
-
-        total_layout.addWidget(total_count)
-
-        grid.addWidget(total_box, 0, 0, 1, 2)
-
-        # -----------------------------------------------------
-        # Helper
-        # -----------------------------------------------------
-        def make_summary_box(title_text, items, bg, border):
-            box = QGroupBox(title_text)
-            box.setMinimumHeight(260)
-            box.setStyleSheet(f"""
-                QGroupBox {{
-                    font-size: 14px;
-                    font-weight: bold;
-                    color: #374151;
-                    border: 1px solid {border};
-                    border-radius: 10px;
-                    margin-top: 8px;
-                    padding-top: 12px;
-                    background: #ffffff;
-                }}
-            """)
-
-            area = QScrollArea()
-            area.setWidgetResizable(True)
-            area.setFrameShape(QScrollArea.Shape.NoFrame)
-
-            widget = QWidget()
-            widget.setStyleSheet("background: transparent;")
-
-            item_grid = QGridLayout(widget)
-            item_grid.setContentsMargins(8, 8, 8, 8)
-            item_grid.setHorizontalSpacing(10)
-            item_grid.setVerticalSpacing(10)
-
-            if not items:
-                empty = QLabel("ไม่มีข้อมูล")
-                empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                empty.setStyleSheet("""
-                    font-size: 16px;
-                    color: #64748b;
-                    padding: 30px;
-                """)
-                item_grid.addWidget(empty, 0, 0, 1, 2)
-            else:
-                for idx, (name, count) in enumerate(items):
-                    card = QWidget()
-                    card.setMinimumHeight(85)
-                    card.setStyleSheet(f"""
-                        QWidget {{
-                            border: 1px solid {border};
-                            border-radius: 9px;
-                            background: {bg};
-                        }}
-                        QLabel {{
-                            border: none;
-                            background: transparent;
-                            color: #334155;
-                        }}
-                    """)
-
-                    card_layout = QVBoxLayout(card)
-                    card_layout.setContentsMargins(8, 7, 8, 7)
-
-                    name_label = QLabel(str(name))
-                    name_label.setAlignment(
-                        Qt.AlignmentFlag.AlignCenter
-                    )
-                    name_label.setWordWrap(True)
-                    name_label.setStyleSheet("""
-                        font-size: 12px;
-                        font-weight: bold;
-                    """)
-
-                    count_label = QLabel(f"{count:,}")
-                    count_label.setAlignment(
-                        Qt.AlignmentFlag.AlignCenter
-                    )
-                    count_label.setStyleSheet("""
-                        font-size: 23px;
-                        font-weight: bold;
-                    """)
-
-                    card_layout.addWidget(name_label)
-                    card_layout.addWidget(count_label)
-
-                    item_grid.addWidget(
-                        card,
-                        idx // 2,
-                        idx % 2
-                    )
-
-            item_grid.setColumnStretch(0, 1)
-            item_grid.setColumnStretch(1, 1)
-
-            area.setWidget(widget)
-
-            box_layout = QVBoxLayout(box)
-            box_layout.addWidget(area)
-
-            return box
-
-        # -----------------------------------------------------
-        # Four summary groups
-        # -----------------------------------------------------
-        grid.addWidget(
-            make_summary_box(
-                "จำนวนคนแต่ละรอบ",
-                data["round"],
-                "#EAF4FF",
-                "#C9DFF5"
-            ),
-            1, 0
+            """
         )
 
-        grid.addWidget(
-            make_summary_box(
-                "จำนวนคนตามคณะ",
-                data["faculty"],
-                "#EEF9F0",
-                "#CDE8D2"
-            ),
-            1, 1
+        total_layout.addWidget(
+            total_count
         )
 
-        grid.addWidget(
-            make_summary_box(
-                "จำนวนคนตามสาขาวิชา",
-                data["major"],
-                "#FFF7E8",
-                "#F1DFC0"
-            ),
-            2, 0
+        window._summary_total_label = (
+            total_count
         )
 
-        grid.addWidget(
-            make_summary_box(
-                "จำนวนคนตามชื่อปริญญา",
-                data["educational"],
-                "#F7EEFF",
-                "#DFD0F0"
-            ),
-            2, 1
+        # สำคัญ:
+        # Total Box ห้ามอยู่ใน grid เพราะ grid จะถูกล้าง
+        # ทุกครั้งที่ Live Summary refresh
+        outer.addWidget(
+            total_box
         )
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
+
+        grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 1)
-        grid.setRowStretch(2, 1)
 
         # -----------------------------------------------------
-        # เปิดเป็นหน้าต่างอิสระ
+        # Initial data
+        # -----------------------------------------------------
+        self._update_dashboard_summary_popup()
+
+        # -----------------------------------------------------
+        # LIVE Timer
+        # -----------------------------------------------------
+        timer = QTimer(window)
+
+        timer.setInterval(
+            500
+        )
+
+        timer.timeout.connect(
+            self._update_dashboard_summary_popup
+        )
+
+        timer.start()
+
+        window._summary_timer = timer
+
+        # -----------------------------------------------------
+        # Clear reference when closed
+        # -----------------------------------------------------
+        def on_window_closed():
+
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+            self._dashboard_summary_window = None
+
+        window.destroyed.connect(
+            on_window_closed
+        )
+
+        # -----------------------------------------------------
+        # Show
         # -----------------------------------------------------
         window.show()
         window.raise_()
@@ -5995,7 +7226,7 @@ class MainWindow(QMainWindow):
 
         self.result_search_edit = QLineEdit()
         self.result_search_edit.setPlaceholderText(
-            "รหัสนักศึกษา / ชื่อ / นามสกุล / RFID"
+            "รหัสนักศึกษา / seq / ชื่อ / RFID / คณะ / สาขาวิชา / ชื่อปริญญา"
         )
         self.result_search_edit.setMinimumHeight(32)
         self.result_search_edit.returnPressed.connect(
@@ -6024,17 +7255,43 @@ class MainWindow(QMainWindow):
         )
         search_layout.addWidget(self.result_print_button)
 
+        # =====================================================
+        # Sorting
+        # =====================================================
+        search_layout.addWidget(QLabel("เรียงตาม:"))
+
+        self.result_sort_combo = QComboBox()
+        self.result_sort_combo.addItems([
+            "No.",
+            "std_id",
+            "seq",
+            "ชื่อ-นามสกุล",
+            "คณะ",
+            "สาขาวิชา",
+            "ชื่อปริญญา",
+            "รอบ"
+        ])
+        self.result_sort_combo.setFixedWidth(125)
+        search_layout.addWidget(self.result_sort_combo)
+
+        self.result_sort_button = QPushButton("น้อย → มาก")
+        self.result_sort_button.setFixedSize(115, 32)
+        self.result_sort_button.setCheckable(True)
+        self.result_sort_button.clicked.connect(self.result_toggle_sort_order)
+        search_layout.addWidget(self.result_sort_button)
+
         layout.addWidget(search_box)
 
         # =====================================================
         # Result Table
         # =====================================================
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(8)
+        self.result_table.setColumnCount(9)
 
         self.result_table.setHorizontalHeaderLabels([
             "No.",
             "std_id",
+            "seq",
             "ชื่อ-นามสกุล",
             "RFID",
             "คณะ",
@@ -6047,6 +7304,7 @@ class MainWindow(QMainWindow):
         widths = [
             55,    # No.
             120,   # std_id
+            80,    # seq
             190,   # ชื่อ-นามสกุล
             230,   # RFID
             180,   # คณะ
@@ -6148,6 +7406,7 @@ class MainWindow(QMainWindow):
         self.result_all_rows = []
         self.result_current_page = 1
         self.result_page_size = 15
+        self.result_sort_desc = False
 
         self.result_search()
 
@@ -6157,7 +7416,7 @@ class MainWindow(QMainWindow):
 
     def load_result_data(self):
 
-        # RFID จาก student.csv
+        # RFID จาก student.db
         student_by_rfid = {}
 
 
@@ -6178,7 +7437,7 @@ class MainWindow(QMainWindow):
                 ] = student
 
 
-        # RFID จาก rfid_tags.txt
+        # RFID จาก student.db
         records = (
             self.read_rfid_log()
         )
@@ -6242,6 +7501,11 @@ class MainWindow(QMainWindow):
                         ""
                     ),
 
+                    "seq": student.get(
+                        "seq",
+                        ""
+                    ),
+
                     "fullname": student.get(
                         "fullname",
                         ""
@@ -6271,6 +7535,9 @@ class MainWindow(QMainWindow):
         rows = list(
             result.values()
         )
+
+        for no, row in enumerate(rows, start=1):
+            row["_no"] = no
 
 
         rows.sort(
@@ -6304,7 +7571,7 @@ class MainWindow(QMainWindow):
 
         item = self.result_table.item(
             row,
-            3
+            4
         )
 
         if item is None:
@@ -6380,7 +7647,7 @@ class MainWindow(QMainWindow):
         else:
 
             info = QLabel(
-                "ไม่พบข้อมูลนักศึกษาใน student.csv"
+                "ไม่พบข้อมูลนักศึกษาใน student.db"
             )
 
 
@@ -6787,71 +8054,86 @@ class MainWindow(QMainWindow):
 
     def result_search(self):
 
-        if not hasattr(
-            self,
-            "result_search_edit"
-        ):
+        if not hasattr(self, "result_search_edit"):
             return
 
-
-        keyword = (
-            self.result_search_edit
-            .text()
-            .strip()
-            .lower()
-        )
-
-
-        rows = (
-            self.load_result_data()
-        )
-
+        keyword = self.result_search_edit.text().strip().lower()
+        rows = self.load_result_data()
 
         if keyword:
-
             filtered = []
-
             for row in rows:
-
-                searchable = " ".join(
-                    [
-                        row.get(
-                            "std_id",
-                            ""
-                        ),
-
-                        row.get(
-                            "fullname",
-                            ""
-                        ),
-
-                        row.get(
-                            "rfid",
-                            ""
-                        )
-                    ]
-                ).lower()
-
+                searchable = " ".join([
+                    row.get("std_id", ""),
+                    row.get("seq", ""),
+                    row.get("fullname", ""),
+                    row.get("rfid", ""),
+                    row.get("faculty", ""),
+                    row.get("major", ""),
+                    row.get("educational", ""),
+                    row.get("round", "")
+                ]).lower()
 
                 if keyword in searchable:
+                    filtered.append(row)
 
-                    filtered.append(
-                        row
-                    )
-
-
-            self.result_all_rows = (
-                filtered
-            )
-
+            self.result_all_rows = filtered
         else:
-
             self.result_all_rows = rows
 
-
+        self.result_apply_sort()
         self.result_current_page = 1
-
         self.result_show_page()
+
+
+    def result_toggle_sort_order(self):
+
+        self.result_sort_desc = self.result_sort_button.isChecked()
+
+        self.result_sort_button.setText(
+            "มาก → น้อย" if self.result_sort_desc else "น้อย → มาก"
+        )
+
+        self.result_apply_sort()
+        self.result_current_page = 1
+        self.result_show_page()
+
+
+    def result_apply_sort(self):
+
+        if not self.result_all_rows:
+            return
+
+        sort_name = self.result_sort_combo.currentText()
+
+        key_map = {
+            "No.": "_no",
+            "std_id": "std_id",
+            "seq": "seq",
+            "ชื่อ-นามสกุล": "fullname",
+            "คณะ": "faculty",
+            "สาขาวิชา": "major",
+            "ชื่อปริญญา": "educational",
+            "รอบ": "round"
+        }
+
+        key_name = key_map.get(sort_name, "std_id")
+
+        def sort_key(row):
+            value = str(row.get(key_name, "") or "").strip()
+
+            # ช่วยให้ค่าตัวเลขเรียงแบบตัวเลขจริง เช่น 1, 2, 10
+            if key_name in ("std_id", "seq", "_no"):
+                digits = "".join(ch for ch in value if ch.isdigit())
+                if digits:
+                    return (0, int(digits), value.lower())
+
+            return (1, value.lower())
+
+        self.result_all_rows.sort(
+            key=sort_key,
+            reverse=self.result_sort_desc
+        )
 
 
     def result_clear_search(self):
@@ -6939,6 +8221,8 @@ class MainWindow(QMainWindow):
                 ),
 
                 data["std_id"],
+
+                data.get("seq", ""),
 
                 data["fullname"],
 
@@ -7079,7 +8363,7 @@ class MainWindow(QMainWindow):
 
             document.setDefaultFont(
                 QFont(
-                    "Arial",
+                    "Prompt",
                     9
                 )
             )
@@ -7091,7 +8375,7 @@ class MainWindow(QMainWindow):
             <meta charset="utf-8">
             <style>
                 body {{
-                    font-family: Arial;
+                    font-family: "Prompt";
                     font-size: 9pt;
                 }}
 
@@ -7135,6 +8419,7 @@ class MainWindow(QMainWindow):
             <tr>
                 <th>No.</th>
                 <th>รหัสนักศึกษา</th>
+                <th>seq</th>
                 <th>ชื่อ-นามสกุล</th>
                 <th>RFID</th>
                 <th>คณะ</th>
@@ -7160,6 +8445,7 @@ class MainWindow(QMainWindow):
                 <tr>
                     <td>{first_number + i}</td>
                     <td>{row["std_id"]}</td>
+                    <td>{row.get("seq", "")}</td>
                     <td>{row["fullname"]}</td>
                     <td>{row["rfid"]}</td>
                     <td>{row["faculty"]}</td>
@@ -7253,16 +8539,94 @@ class MainWindow(QMainWindow):
             text
         )
 
+        # -----------------------------------------------------
+        # WinError 10054
+        # Reader ปิด/ตัด TCP connection เอง
+        #
+        # ไม่ควรเด้ง QMessageBox มาขวางการสแกน
+        # ให้แสดงสถานะและ reconnect อัตโนมัติแทน
+        # -----------------------------------------------------
+        error_text = str(text)
+        error_lower = error_text.lower()
+
+        is_connection_lost = (
+            any(code in error_text for code in (
+                "10053", "10054", "10060", "10061", "11001"
+            ))
+            or "forcibly closed by the remote host" in error_lower
+            or "connection reset by peer" in error_lower
+            or "timed out" in error_lower
+            or "broken pipe" in error_lower
+            or "connection aborted" in error_lower
+        )
+
+        if (
+            is_connection_lost
+            and not self.manual_reader_close
+        ):
+            # จำไว้ว่าก่อนหลุดกำลังอ่านอยู่ เพื่อ resume หลัง reconnect
+            self.auto_resume_scan = True
+
+            self.status_label.setText(
+                "Reader หลุดชั่วคราว - กำลังเชื่อมต่อใหม่..."
+            )
+
+            if (
+                self.reconnect_timer is None
+                or not self.reconnect_timer.isActive()
+            ):
+                self.reconnect_timer = QTimer(self)
+                self.reconnect_timer.setSingleShot(True)
+                self.reconnect_timer.timeout.connect(
+                    self._reconnect_reader
+                )
+                self.reconnect_timer.start(1000)
+
+            return
+
+        # Error อื่น ๆ ยังแจ้งเตือนตามปกติ
         self.status_label.setText(
             "Error"
         )
 
-
-        QMessageBox.warning(
-            self,
-            "RFID Error",
-            text
+        # Error ที่ไม่ใช่ connection ก็แสดงใน status โดยไม่บล็อกหน้าจอ
+        # เพื่อให้โหมดอ่านผ่านประตูทำงานต่อได้
+        self.status_label.setText(
+            f"RFID Error: {text}"
         )
+
+
+    def _reconnect_reader(self):
+
+        self.reconnect_timer = None
+
+        # ถ้าผู้ใช้กด Close/Exit ระหว่างรอ reconnect
+        # ห้ามเปิด connection กลับขึ้นมา
+        if self.manual_reader_close:
+            return
+
+        # ถ้ามี worker ตัวใหม่/เก่าที่ยังทำงานอยู่ ไม่ต้องสร้างซ้ำ
+        if (
+            self.worker is not None
+            and self.worker.isRunning()
+        ):
+            return
+
+        print(
+            "RFID: reconnecting..."
+        )
+
+        self.connect_reader()
+
+        if self.auto_resume_scan and self.worker is not None:
+            self.worker.round_token = self.round_token
+            self.worker.start_scan()
+            self.query_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.status_label.setText(
+                f"Scanning... {self.current_round}"
+            )
+            self.auto_resume_scan = False
 
 
     # ========================================================
@@ -7285,7 +8649,7 @@ class MainWindow(QMainWindow):
         )
 
         self.query_button.setEnabled(
-            False
+            not self.auto_resume_scan
         )
 
         self.stop_button.setEnabled(
@@ -7296,9 +8660,11 @@ class MainWindow(QMainWindow):
             True
         )
 
-        self.port_edit.setEnabled(
-            True
-        )
+        self.port_edit.setEnabled(True)
+        self.connection_type_combo.setEnabled(True)
+        self.com_combo.setEnabled(True)
+        self.refresh_com_button.setEnabled(True)
+        self.baud_combo.setEnabled(True)
 
 
         self.worker = None
@@ -7309,6 +8675,17 @@ class MainWindow(QMainWindow):
     # ========================================================
 
     def close_reader(self):
+
+        # ผู้ใช้สั่งปิดเอง ไม่ต้อง reconnect
+        self.manual_reader_close = True
+        self.auto_resume_scan = False
+
+        if (
+            self.reconnect_timer is not None
+            and self.reconnect_timer.isActive()
+        ):
+            self.reconnect_timer.stop()
+            self.reconnect_timer = None
 
         if self.worker:
 
@@ -7346,9 +8723,13 @@ class MainWindow(QMainWindow):
             True
         )
 
-        self.port_edit.setEnabled(
-            True
-        )
+        self.port_edit.setEnabled(True)
+        self.connection_type_combo.setEnabled(True)
+        self.com_combo.setEnabled(True)
+        self.refresh_com_button.setEnabled(True)
+        self.baud_combo.setEnabled(True)
+
+        self.rf_power_combo.setEnabled(True)
 
 
     # ========================================================
@@ -7391,6 +8772,10 @@ class MainWindow(QMainWindow):
 
             self.stop_api_sender()
 
+        if hasattr(self, "api_bulk_timer"):
+            self.api_bulk_running = False
+            self.api_bulk_timer.stop()
+
 
         self.close_reader()
 
@@ -7411,6 +8796,48 @@ def main():
         "Fusion"
     )
 
+    # ---------------------------------------------------------
+    # โหลด Prompt จากโฟลเดอร์ fonts/
+    # ---------------------------------------------------------
+    prompt_family = load_prompt_font()
+
+    # ตั้ง Prompt เป็นฟอนต์หลักทั้งโปรแกรม
+    app.setFont(
+        QFont(
+            prompt_family,
+            10
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Global stylesheet
+    # ---------------------------------------------------------
+    app.setStyleSheet("""
+        QWidget {
+            font-family: "Prompt";
+            font-size: 10pt;
+        }
+
+        QLabel {
+            font-family: "Prompt";
+        }
+
+        QLineEdit, QComboBox, QPushButton {
+            font-family: "Prompt";
+            font-size: 10pt;
+        }
+
+        QTableWidget, QTableWidgetItem,
+        QHeaderView, QTabWidget, QTabBar {
+            font-family: "Prompt";
+            font-size: 10pt;
+        }
+
+        QGroupBox {
+            font-family: "Prompt";
+            font-weight: bold;
+        }
+    """)
 
     window = MainWindow()
 
